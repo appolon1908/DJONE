@@ -4,15 +4,41 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, codestra-ci, djone-ci]
+    env:
+      DB_CONTAINER: djone-ci-test-postgres-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.13" }
+      - name: Start isolated PostgreSQL
+        run: |
+          docker rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
+          docker run -d --name "$DB_CONTAINER" \
+            -e POSTGRES_USER=djone \
+            -e POSTGRES_PASSWORD=djone \
+            -e POSTGRES_DB=djone \
+            -p 127.0.0.1::5432 \
+            -v "$PWD/infra/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro" \
+            postgres:17-alpine
+          db_addr=$(docker port "$DB_CONTAINER" 5432/tcp)
+          db_port=${db_addr##*:}
+          echo "DATABASE_URL=postgresql://djone:djone@127.0.0.1:${db_port}/djone" >> "$GITHUB_ENV"
+          for i in {1..30}; do
+            if docker exec "$DB_CONTAINER" pg_isready -U djone -d djone >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs "$DB_CONTAINER"
+          exit 1
       - run: pip install -r services/api/requirements.txt
       - run: PYTHONPATH=services/api pytest -q
+      - if: always()
+        run: docker rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
   compose:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, codestra-ci, djone-ci]
+    env:
+      COMPOSE_PROJECT_NAME: djone-ci-${{ github.run_id }}
+      DJONE_HTTP_PORT: "0"
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config
@@ -20,7 +46,9 @@ jobs:
       - run: docker build -t djone-mixxx-bridge:test services/mixxx-bridge
       - run: |
           DJONE_API_TOKEN=test-api BRIDGE_TOKEN=test-bridge POSTGRES_PASSWORD=test-db docker compose up -d --build
-          for i in {1..30}; do curl -fsS http://127.0.0.1:8090/health && break; sleep 2; done
-          curl -fsS http://127.0.0.1:8090/ready
+          api_addr=$(docker compose port api 8090)
+          api_port=${api_addr##*:}
+          for i in {1..30}; do curl -fsS http://127.0.0.1:${api_port}/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:${api_port}/ready
       - if: always()
         run: docker compose logs --no-color && docker compose down -v

@@ -2,25 +2,152 @@ name: ci
 on:
   push:
   pull_request:
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: djone
+          POSTGRES_PASSWORD: test-db
+          POSTGRES_DB: djone
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U djone -d djone"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://djone:test-db@127.0.0.1:5432/djone
+      DJONE_ENV: development
+      MIXXX_EXECUTION_ENABLED: 'false'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
       - run: pip install -r services/api/requirements.txt
+      - name: Initialize disposable database and prove closed execution gates
+        run: |
+          python - <<'PY'
+          import os, pathlib, psycopg
+          with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as db:
+              db.execute(pathlib.Path("infra/postgres/init.sql").read_text())
+              state = db.execute("SELECT execution_enabled, certified FROM safety_state WHERE singleton=true").fetchone()
+              assert state == (False, False)
+          PY
       - run: PYTHONPATH=services/api pytest -q
+
   compose:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: djone-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      COMPOSE_FILE: compose.yaml:.github/compose-ci.yml
+      DJONE_HTTP_PORT: '0'
+      DJONE_API_TOKEN: test-api
+      BRIDGE_TOKEN: test-bridge
+      POSTGRES_PASSWORD: test-db
+      MIXXX_EXECUTION_ENABLED: 'false'
     steps:
-      - uses: actions/checkout@v4
-      - run: docker compose config
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prepare isolated empty media fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/djone-empty-music"
+          echo "DJONE_MUSIC_DIR=$RUNNER_TEMP/djone-empty-music" >> "$GITHUB_ENV"
+      - run: docker compose config --quiet
       - run: docker build -t djone-api:test services/api
       - run: docker build -t djone-mixxx-bridge:test services/mixxx-bridge
-      - run: |
-          DJONE_API_TOKEN=test-api BRIDGE_TOKEN=test-bridge POSTGRES_PASSWORD=test-db docker compose up -d --build
-          for i in {1..30}; do curl -fsS http://127.0.0.1:8090/health && break; sleep 2; done
-          curl -fsS http://127.0.0.1:8090/ready
+      - name: Smoke-test exact source through its allocated loopback port
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose up -d --build
+          api_addr="$(docker compose port api 8090)"
+          api_port="${api_addr##*:}"
+          [[ "$api_port" =~ ^[0-9]+$ ]]
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$api_port/health" > "$RUNNER_TEMP/djone-health.json"; then break; fi
+            test "$attempt" -lt 30
+            sleep 2
+          done
+          curl -fsS "http://127.0.0.1:$api_port/ready" > "$RUNNER_TEMP/djone-ready.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          health = json.loads((root / "djone-health.json").read_text())
+          ready = json.loads((root / "djone-ready.json").read_text())
+          assert health["status"] == "ok" and health["service"] == "djone-api"
+          assert ready["ready"] is True and ready["mixxx_execution_enabled"] is False
+          PY
+          docker compose exec -T mixxx-bridge python -c 'import json,urllib.request; x=json.load(urllib.request.urlopen("http://127.0.0.1:8091/health")); assert x["native_reachable"] is False; assert x["execution_enabled"] is False; assert x["certified"] is False'
+          ! docker compose ps --services --status running | grep -qx webhook-worker
       - if: always()
-        run: docker compose logs --no-color && docker compose down -v
+        run: |
+          docker compose logs --no-color || true
+          docker compose down -v --remove-orphans
+
+  source-quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - run: python -m compileall -q services native scripts tests
+      - name: Validate shell and native mapping syntax without running hardware tools
+        run: |
+          while IFS= read -r path; do bash -n "$path"; done < <(git ls-files '*.sh')
+          python -c 'import xml.etree.ElementTree as E; E.parse("native/DJONE-Mixxx.midi.xml")'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - run: node --check services/api/app/ui/app.js
+
+  dependency-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - run: python -m pip install pip-audit
+      - run: pip-audit -r services/api/requirements.txt
+      - run: pip-audit -r services/mixxx-bridge/requirements.txt
+
+  source-secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan complete tracked history and effective tree with verified Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact=100 --exit-code 1 .
+          "$RUNNER_TEMP/gitleaks" dir --no-banner --redact=100 --exit-code 1 .

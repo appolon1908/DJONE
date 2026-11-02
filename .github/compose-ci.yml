@@ -1,0 +1,8 @@
+# Disposable hosted CI only. Production Compose is unchanged.
+services:
+  mixxx-bridge:
+    environment:
+      DJONE_MIXXX_HOST: 127.0.0.1
+      DJONE_MIXXX_TOKEN: ""
+  webhook-worker:
+    profiles: [disabled-in-ci]
